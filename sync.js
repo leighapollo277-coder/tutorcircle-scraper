@@ -16,9 +16,9 @@ const sheets = google.sheets({ version: 'v4', auth });
 const drive = google.drive({ version: 'v3', auth });
 
 const HEADERS = [
-    'Case ID', 'Applying URL', 'Grade', 'Subject', 'Fee', 'General Location', 'Date', 
+    'Case ID', 'Grade', 'Subject', 'Fee', 'General Location', 'Date', 
     'Specific Location', 'Lessons/Week', 'Duration', 'Availability', 
-    'Other Req', 'Applicants', 'Scraped At', 'Checked At', 'Status'
+    'Other Req', 'Applicants', 'Scraped At', 'Checked At', 'Status', 'Applying URL'
 ];
 
 async function initSpreadsheet() {
@@ -51,11 +51,10 @@ async function getSheetData(spreadsheetId, range) {
 
 async function syncTab(spreadsheetId, tabName, records, filterFn = (r) => true) {
     console.log(`Syncing ${tabName}...`);
-    const existingData = await getSheetData(spreadsheetId, `'${tabName}'!A:O`);
+    const existingData = await getSheetData(spreadsheetId, `'${tabName}'!A:P`);
     const now = new Date().toLocaleString();
     
     // Create map of existing data for quick lookup
-    // existingRows[CaseID] = fullRowArray
     const existingMap = new Map();
     if (existingData.length > 1) {
         existingData.slice(1).forEach(row => {
@@ -79,48 +78,53 @@ async function syncTab(spreadsheetId, tabName, records, filterFn = (r) => true) 
 
         if (existingMap.has(caseId)) {
             const existingRow = existingMap.get(caseId);
-            scrapedAt = existingRow[13] || r['Scraped At'];
-            // Preserve status if it's already set (e.g., 'Existing', 'Applied')
-            status = existingRow[15] || 'Existing';
+            scrapedAt = existingRow[12] || r['Scraped At'];
+            status = existingRow[14] || 'Existing';
             checkedAt = now; 
         }
 
+        const applyingUrl = `https://tutorcircle.hk/case_apply.php?case_id=${caseId}`;
+
         const row = [
-            r['Case ID'], 
-            `https://tutorcircle.hk/case_apply.php?case_id=${caseId}`,
-            r['Grade'], r['Subject'], r['Fee'], r['General Location'], 
+            caseId, r['Grade'], r['Subject'], r['Fee'], r['General Location'], 
             r['Date'], r['Specific Location'], r['Lessons/Week'], r['Duration'], 
-            r['Availability'], r['Other Req'], r['Applicants'], scrapedAt, checkedAt, status
+            r['Availability'], r['Other Req'], r['Applicants'], scrapedAt, checkedAt, status, applyingUrl
         ];
         finalRows.push(row);
     }
 
-    // Capture rows that are in the Sheet but NOT in the Latest CSV (Optional: Mark as Closed?)
+    // Capture rows that are in the Sheet but NOT in the Latest CSV
     for (const [id, row] of existingMap) {
         if (!seenInCSV.has(id)) {
-            row[14] = now; 
-            if (!row[15]) row[15] = 'Existing';
+            row[13] = now; 
+            if (!row[14]) row[14] = 'Existing';
+            // Ensure URL is present for existing rows if it was missing
+            if (row.length < 16) {
+                row[15] = `https://tutorcircle.hk/case_apply.php?case_id=${id}`;
+            }
             finalRows.push(row);
         }
     }
 
-    // Sort by Date (Index 6) descending
-    const headerRow = finalRows.shift();
-    finalRows.sort((a, b) => {
-        const dateA = a[6] || '';
-        const dateB = b[6] || '';
-        return dateB.localeCompare(dateA);
+    // FINAL SORT: Date descending
+    // Header is at index 0, so we sort the rest
+    const dataRows = finalRows.slice(1);
+    dataRows.sort((a, b) => {
+        const dateA = new Date(a[5] || 0);
+        const dateB = new Date(b[5] || 0);
+        return dateB - dateA;
     });
-    finalRows.unshift(headerRow);
+
+    const outputRows = [HEADERS, ...dataRows];
 
     // Update Sheet
     await sheets.spreadsheets.values.update({
         spreadsheetId,
         range: `'${tabName}'!A1`,
-        valueInputOption: 'USER_ENTERED', // Use USER_ENTERED to make URLs clickable
-        resource: { values: finalRows }
+        valueInputOption: 'RAW',
+        resource: { values: outputRows }
     });
-    console.log(`Updated ${finalRows.length - 1} rows in '${tabName}'`);
+    console.log(`Updated ${outputRows.length - 1} rows in '${tabName}'`);
 }
 
 async function sync() {
