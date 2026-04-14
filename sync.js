@@ -15,59 +15,28 @@ auth.scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.goog
 const sheets = google.sheets({ version: 'v4', auth });
 const drive = google.drive({ version: 'v3', auth });
 
+const HEADERS = [
+    'Case ID', 'Grade', 'Subject', 'Fee', 'General Location', 'Date', 
+    'Specific Location', 'Lessons/Week', 'Duration', 'Availability', 
+    'Other Req', 'Applicants', 'Scraped At', 'Checked At', 'Status'
+];
+
 async function initSpreadsheet() {
     let spreadsheetId = process.env.SPREADSHEET_ID;
-
     if (!spreadsheetId) {
-        console.log('No SPREADSHEET_ID found. Creating a new one...');
-        const res = await sheets.spreadsheets.create({
-            resource: {
-                properties: { title: 'TutorCircle Auto Apply Tracker' }
-            }
-        });
-        spreadsheetId = res.data.spreadsheetId;
-        console.log(`Created Spreadsheet ID: ${spreadsheetId}`);
-
-        if (process.env.USER_EMAIL) {
-            console.log(`Sharing with ${process.env.USER_EMAIL}...`);
-            await drive.permissions.create({
-                fileId: spreadsheetId,
-                requestBody: {
-                    type: 'user',
-                    role: 'editor',
-                    emailAddress: process.env.USER_EMAIL
-                }
-            });
-            console.log('Shared successfully.');
-        }
-
-        const envContent = fs.readFileSync(ENV_PATH, 'utf-8');
-        const updatedEnv = envContent.replace(/SPREADSHEET_ID=.*/, `SPREADSHEET_ID=${spreadsheetId}`);
-        fs.writeFileSync(ENV_PATH, updatedEnv);
-        console.log('Updated .env with new SPREADSHEET_ID');
+        throw new Error('SPREADSHEET_ID missing in .env');
     }
-
     return spreadsheetId;
 }
 
 async function ensureSheets(spreadsheetId) {
     const res = await sheets.spreadsheets.get({ spreadsheetId });
     const sheetTitles = res.data.sheets.map(s => s.properties.title);
-    
     const requests = [];
-    if (!sheetTitles.includes('All Cases')) {
-        requests.push({ addSheet: { properties: { title: 'All Cases' } } });
-    }
-    if (!sheetTitles.includes('Actionable')) {
-        requests.push({ addSheet: { properties: { title: 'Actionable' } } });
-    }
-
+    if (!sheetTitles.includes('All Cases')) requests.push({ addSheet: { properties: { title: 'All Cases' } } });
+    if (!sheetTitles.includes('Actionable')) requests.push({ addSheet: { properties: { title: 'Actionable' } } });
     if (requests.length > 0) {
-        await sheets.spreadsheets.batchUpdate({
-            spreadsheetId,
-            resource: { requests }
-        });
-        console.log('Created missing sheets.');
+        await sheets.spreadsheets.batchUpdate({ spreadsheetId, resource: { requests } });
     }
 }
 
@@ -80,69 +49,89 @@ async function getSheetData(spreadsheetId, range) {
     }
 }
 
-async function sync() {
-    console.log('--- Starting Spreadsheet Sync (Pure GoogleAPI) ---');
+async function syncTab(spreadsheetId, tabName, records, filterFn = (r) => true) {
+    console.log(`Syncing ${tabName}...`);
+    const existingData = await getSheetData(spreadsheetId, `'${tabName}'!A:O`);
+    const now = new Date().toLocaleString();
     
-    const spreadsheetId = await initSpreadsheet();
-    await ensureSheets(spreadsheetId);
+    // Create map of existing data for quick lookup
+    // existingRows[CaseID] = fullRowArray
+    const existingMap = new Map();
+    if (existingData.length > 1) {
+        existingData.slice(1).forEach(row => {
+            if (row[0]) existingMap.set(row[0], row);
+        });
+    }
 
-    // Initial Headers if empty
-    const headers = [
-        'Case ID', 'Grade', 'Subject', 'Fee', 'General Location', 'Date', 
-        'Specific Location', 'Lessons/Week', 'Duration', 'Availability', 
-        'Other Req', 'Applicants', 'Scraped At'
-    ];
+    const finalRows = [HEADERS];
+    const seenInCSV = new Set();
 
-    // Load CSV
+    // Process CSV records
+    for (const r of records) {
+        if (!filterFn(r)) continue;
+        
+        const caseId = r['Case ID'];
+        seenInCSV.add(caseId);
+
+        let status = 'New';
+        let scrapedAt = r['Scraped At'];
+        let checkedAt = now;
+
+        if (existingMap.has(caseId)) {
+            const existingRow = existingMap.get(caseId);
+            scrapedAt = existingRow[12] || r['Scraped At'];
+            // Preserve status if it's already set (e.g., 'Existing', 'Applied')
+            status = existingRow[14] || 'Existing';
+            checkedAt = now; 
+        }
+
+        const row = [
+            r['Case ID'], r['Grade'], r['Subject'], r['Fee'], r['General Location'], 
+            r['Date'], r['Specific Location'], r['Lessons/Week'], r['Duration'], 
+            r['Availability'], r['Other Req'], r['Applicants'], scrapedAt, checkedAt, status
+        ];
+        finalRows.push(row);
+    }
+
+    // Capture rows that are in the Sheet but NOT in the Latest CSV (Optional: Mark as Closed?)
+    // For now, we keep them as is.
+    for (const [id, row] of existingMap) {
+        if (!seenInCSV.has(id)) {
+            // Row is in sheet but not in CSV. 
+            // We update Checked At to signify the script checked the site but didn't find this ID.
+            row[13] = now; 
+            if (!row[14]) row[14] = 'Existing';
+            finalRows.push(row);
+        }
+    }
+
+    // Update Sheet
+    await sheets.spreadsheets.values.update({
+        spreadsheetId,
+        range: `'${tabName}'!A1`,
+        valueInputOption: 'RAW',
+        resource: { values: finalRows }
+    });
+    console.log(`Updated ${finalRows.length - 1} rows in '${tabName}'`);
+}
+
+async function sync() {
+    console.log('--- Starting Spreadsheet Heartbeat Sync ---');
     if (!fs.existsSync(CSV_PATH)) return console.error('CSV not found');
     const records = parse(fs.readFileSync(CSV_PATH, 'utf-8'), { columns: true });
 
-    // Sync "All Cases"
-    const allExisting = await getSheetData(spreadsheetId, "'All Cases'!A:M");
-    if (allExisting.length === 0) {
-        await sheets.spreadsheets.values.update({
-            spreadsheetId, range: "'All Cases'!A1",
-            valueInputOption: 'RAW', resource: { values: [headers] }
-        });
-    }
-    const existingAllIds = new Set(allExisting.map(row => row[0]));
-    const newAllRows = records.filter(r => !existingAllIds.has(r['Case ID']))
-                             .map(r => headers.map(h => r[h]));
+    const spreadsheetId = await initSpreadsheet();
+    await ensureSheets(spreadsheetId);
 
-    if (newAllRows.length > 0) {
-        await sheets.spreadsheets.values.append({
-            spreadsheetId, range: "'All Cases'!A1",
-            valueInputOption: 'RAW', resource: { values: newAllRows }
-        });
-        console.log(`Added ${newAllRows.length} to 'All Cases'`);
-    }
+    // Sync All Cases
+    await syncTab(spreadsheetId, 'All Cases', records);
 
-    // Sync "Actionable"
-    const actionableExisting = await getSheetData(spreadsheetId, "'Actionable'!A:N");
-    const actionableHeaders = [...headers, 'Status'];
-    if (actionableExisting.length === 0) {
-        await sheets.spreadsheets.values.update({
-            spreadsheetId, range: "'Actionable'!A1",
-            valueInputOption: 'RAW', resource: { values: [actionableHeaders] }
-        });
-    }
-    const existingActionableIds = new Set(actionableExisting.map(row => row[0]));
-    
+    // Sync Actionable
     const gradeFilter = /中(四|五|六)/;
     const subjectFilter = /(數學|M1|M2|Math)/i;
-
-    const newActionableRows = records
-        .filter(r => gradeFilter.test(r['Grade']) && subjectFilter.test(r['Subject']))
-        .filter(r => !existingActionableIds.has(r['Case ID']))
-        .map(r => [...headers.map(h => r[h]), 'New']);
-
-    if (newActionableRows.length > 0) {
-        await sheets.spreadsheets.values.append({
-            spreadsheetId, range: "'Actionable'!A1",
-            valueInputOption: 'RAW', resource: { values: newActionableRows }
-        });
-        console.log(`Added ${newActionableRows.length} to 'Actionable'`);
-    }
+    await syncTab(spreadsheetId, 'Actionable', records, (r) => {
+        return gradeFilter.test(r['Grade']) && subjectFilter.test(r['Subject']);
+    });
 
     console.log(`Sync Finished. URL: https://docs.google.com/spreadsheets/d/${spreadsheetId}`);
 }
