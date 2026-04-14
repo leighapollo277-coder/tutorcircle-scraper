@@ -6,14 +6,12 @@ require('dotenv').config();
 
 const CREDENTIALS_PATH = path.join(__dirname, process.env.SERVICE_ACCOUNT_PATH || 'unified-hull-493305-c5-7c5d90279adf.json');
 const CSV_PATH = path.join(__dirname, 'cases.csv');
-const ENV_PATH = path.join(__dirname, '.env');
 
 const credentials = JSON.parse(fs.readFileSync(CREDENTIALS_PATH));
 const auth = google.auth.fromJSON(credentials);
 auth.scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive'];
 
 const sheets = google.sheets({ version: 'v4', auth });
-const drive = google.drive({ version: 'v3', auth });
 
 const HEADERS = [
     'Case ID', 'Grade', 'Subject', 'Fee', 'General Location', 'Date', 
@@ -23,9 +21,7 @@ const HEADERS = [
 
 async function initSpreadsheet() {
     let spreadsheetId = process.env.SPREADSHEET_ID;
-    if (!spreadsheetId) {
-        throw new Error('SPREADSHEET_ID missing in .env');
-    }
+    if (!spreadsheetId) throw new Error('SPREADSHEET_ID missing in .env');
     return spreadsheetId;
 }
 
@@ -44,17 +40,18 @@ async function getSheetData(spreadsheetId, range) {
     try {
         const res = await sheets.spreadsheets.values.get({ spreadsheetId, range });
         return res.data.values || [];
-    } catch (e) {
-        return [];
-    }
+    } catch (e) { return []; }
+}
+
+function getHKTime() {
+    return new Date().toLocaleString('zh-HK', { timeZone: 'Asia/Hong_Kong' });
 }
 
 async function syncTab(spreadsheetId, tabName, records, filterFn = (r) => true) {
     console.log(`Syncing ${tabName}...`);
     const existingData = await getSheetData(spreadsheetId, `'${tabName}'!A:P`);
-    const now = new Date().toLocaleString();
+    const now = getHKTime();
     
-    // Create map of existing data for quick lookup
     const existingMap = new Map();
     if (existingData.length > 1) {
         existingData.slice(1).forEach(row => {
@@ -62,13 +59,20 @@ async function syncTab(spreadsheetId, tabName, records, filterFn = (r) => true) 
         });
     }
 
+    const filteredRecords = records.filter(filterFn);
+
+    // Sorting by Date (Descending) and Case ID (Descending)
+    filteredRecords.sort((a, b) => {
+        const dateA = new Date(a.Date);
+        const dateB = new Date(b.Date);
+        if (dateB - dateA !== 0) return dateB - dateA;
+        return parseInt(b['Case ID']) - parseInt(a['Case ID']);
+    });
+
     const finalRows = [HEADERS];
     const seenInCSV = new Set();
 
-    // Process CSV records
-    for (const r of records) {
-        if (!filterFn(r)) continue;
-        
+    for (const r of filteredRecords) {
         const caseId = r['Case ID'];
         seenInCSV.add(caseId);
 
@@ -83,62 +87,44 @@ async function syncTab(spreadsheetId, tabName, records, filterFn = (r) => true) 
             checkedAt = now; 
         }
 
-        const applyingUrl = `https://tutorcircle.hk/case_apply.php?case_id=${caseId}`;
+        const applyUrl = `https://tutorcircle.hk/case_apply.php?case_id=${caseId}`;
 
         const row = [
-            caseId, r['Grade'], r['Subject'], r['Fee'], r['General Location'], 
+            r['Case ID'], r['Grade'], r['Subject'], r['Fee'], r['General Location'], 
             r['Date'], r['Specific Location'], r['Lessons/Week'], r['Duration'], 
-            r['Availability'], r['Other Req'], r['Applicants'], scrapedAt, checkedAt, status, applyingUrl
+            r['Availability'], r['Other Req'], r['Applicants'], scrapedAt, checkedAt, status, applyUrl
         ];
         finalRows.push(row);
     }
 
-    // Capture rows that are in the Sheet but NOT in the Latest CSV
+    // Keep rows that are in the sheet but not in the latest scrape (as they might be closed)
     for (const [id, row] of existingMap) {
         if (!seenInCSV.has(id)) {
-            row[13] = now; 
-            if (!row[14]) row[14] = 'Existing';
-            // Ensure URL is present for existing rows if it was missing
-            if (row.length < 16) {
-                row[15] = `https://tutorcircle.hk/case_apply.php?case_id=${id}`;
-            }
+            row[13] = now; // Update heart beat
             finalRows.push(row);
         }
     }
 
-    // FINAL SORT: Date descending
-    // Header is at index 0, so we sort the rest
-    const dataRows = finalRows.slice(1);
-    dataRows.sort((a, b) => {
-        const dateA = new Date(a[5] || 0);
-        const dateB = new Date(b[5] || 0);
-        return dateB - dateA;
-    });
-
-    const outputRows = [HEADERS, ...dataRows];
-
-    // Update Sheet
+    // Update entire sheet
     await sheets.spreadsheets.values.update({
         spreadsheetId,
         range: `'${tabName}'!A1`,
         valueInputOption: 'RAW',
-        resource: { values: outputRows }
+        resource: { values: finalRows }
     });
-    console.log(`Updated ${outputRows.length - 1} rows in '${tabName}'`);
+    console.log(`Updated ${finalRows.length - 1} rows in '${tabName}'`);
 }
 
 async function sync() {
-    console.log('--- Starting Spreadsheet Heartbeat Sync ---');
+    console.log('--- Starting Optimized Spreadsheet Sync (HKT & Sorting) ---');
     if (!fs.existsSync(CSV_PATH)) return console.error('CSV not found');
     const records = parse(fs.readFileSync(CSV_PATH, 'utf-8'), { columns: true });
 
     const spreadsheetId = await initSpreadsheet();
     await ensureSheets(spreadsheetId);
 
-    // Sync All Cases
     await syncTab(spreadsheetId, 'All Cases', records);
 
-    // Sync Actionable
     const gradeFilter = /中(四|五|六)/;
     const subjectFilter = /(數學|M1|M2|Math)/i;
     await syncTab(spreadsheetId, 'Actionable', records, (r) => {

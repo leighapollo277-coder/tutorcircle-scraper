@@ -130,7 +130,7 @@ async function scrape() {
                         id,
                         ...headerInfo,
                         ...details,
-                        timestamp: new Date().toLocaleString()
+                        timestamp: new Date().toLocaleString('zh-HK', { timeZone: 'Asia/Hong_Kong' })
                     });
                 } else {
                     console.warn(`Could not extract details for Case ID: ${id}`);
