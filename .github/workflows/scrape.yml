@@ -1,0 +1,46 @@
+name: TutorCircle Scraper
+
+on:
+  schedule:
+    - cron: '0 * * * *' # Every hour
+  workflow_dispatch: # Allows manual trigger
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Install Playwright Browsers
+        run: npx playwright install chromium
+
+      - name: Run Scraper
+        run: node scraper.js
+
+      - name: Sync to Google Sheets
+        env:
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          USER_EMAIL: ${{ secrets.USER_EMAIL }}
+        run: |
+          echo "$SERVICE_ACCOUNT_JSON" > credentials.json
+          export SERVICE_ACCOUNT_PATH=credentials.json
+          node sync.js
+          rm credentials.json
+
+      - name: Commit and Push changes
+        run: |
+          git config --global user.name "Scraper Bot"
+          git config --global user.email "bot@tutorcircle-auto-apply.com"
+          git add cases.csv
+          git commit -m "Auto-update: New TutorCircle cases [skip ci]" || echo "No changes to commit"
+          git push
